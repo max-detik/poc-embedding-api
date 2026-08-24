@@ -19,6 +19,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from onnx_embeddings import ONNXEmbeddings
+from onnx_reranker import ONNXReranker
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("onnx-embeddings-service")
@@ -43,14 +44,21 @@ QUERY_INSTRUCTION = os.getenv("QUERY_INSTRUCTION", "task: search result | query:
 # model's default.
 TEXT_INSTRUCTION = os.getenv("TEXT_INSTRUCTION", "")
 
+RERANKER_MODEL_NAME = os.getenv("RERANKER_MODEL_NAME", "onnx-community/bge-reranker-v2-m3-ONNX")
+RERANKER_ONNX_FILE_NAME = os.getenv("RERANKER_ONNX_FILE_NAME", "model_quantized.onnx")
+RERANKER_ONNX_SUBFOLDER = os.getenv("RERANKER_ONNX_SUBFOLDER", "onnx")
+RERANKER_MAX_LENGTH = int(os.getenv("RERANKER_MAX_LENGTH", "8192"))
+RERANKER_BATCH_SIZE = int(os.getenv("RERANKER_BATCH_SIZE", "4"))
+
 if DEVICE == "cuda" and ONNX_PROVIDER == "CPUExecutionProvider":
     logger.warning(
         "DEVICE=cuda but ONNX_PROVIDER=CPUExecutionProvider — set "
         "ONNX_PROVIDER=CUDAExecutionProvider to actually use the GPU."
     )
 
-# Embedding model is created once at startup and reused across requests.
+# Embedding/reranker models are created once at startup and reused across requests.
 _embed_model: Optional[ONNXEmbeddings] = None
+_reranker_model: Optional[ONNXReranker] = None
 
 
 def build_embed_model() -> ONNXEmbeddings:
@@ -71,12 +79,30 @@ def build_embed_model() -> ONNXEmbeddings:
     )
 
 
+def build_reranker_model() -> ONNXReranker:
+    logger.info(
+        "Loading ONNXReranker: model=%s device=%s onnx_file=%s provider=%s",
+        RERANKER_MODEL_NAME, DEVICE, RERANKER_ONNX_FILE_NAME, ONNX_PROVIDER,
+    )
+    return ONNXReranker(
+        model_id=RERANKER_MODEL_NAME,
+        onnx_file_name=RERANKER_ONNX_FILE_NAME,
+        onnx_subfolder=RERANKER_ONNX_SUBFOLDER,
+        device=DEVICE,
+        provider=ONNX_PROVIDER,
+        max_length=RERANKER_MAX_LENGTH,
+        batch_size=RERANKER_BATCH_SIZE,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _embed_model
+    global _embed_model, _reranker_model
     _embed_model = build_embed_model()
+    _reranker_model = build_reranker_model()
     yield
     _embed_model = None
+    _reranker_model = None
 
 
 app = FastAPI(
@@ -109,6 +135,23 @@ class EmbeddingsResponse(BaseModel):
     count: int
 
 
+class RerankRequest(BaseModel):
+    query: str = Field(..., description="Search query to rerank documents against.")
+    documents: List[str] = Field(..., description="Candidate documents to score and rerank.")
+    top_n: Optional[int] = Field(None, description="If set, only return the top N results.")
+
+
+class RerankResultItem(BaseModel):
+    index: int
+    document: str
+    score: float
+
+
+class RerankResponse(BaseModel):
+    results: List[RerankResultItem]
+    count: int
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -120,6 +163,8 @@ def health():
         "device": DEVICE,
         "onnx_file_name": ONNX_FILE_NAME,
         "onnx_provider": ONNX_PROVIDER,
+        "reranker_model": RERANKER_MODEL_NAME,
+        "reranker_onnx_file_name": RERANKER_ONNX_FILE_NAME,
     }
 
 
@@ -153,6 +198,23 @@ def embed_documents(payload: EmbedDocumentsRequest):
 
     dims = len(vectors[0]) if vectors else 0
     return EmbeddingsResponse(embeddings=vectors, dimensions=dims, count=len(vectors))
+
+
+@app.post("/rerank", response_model=RerankResponse)
+def rerank(payload: RerankRequest):
+    """Score and rerank documents against a query, highest relevance first."""
+    if _reranker_model is None:
+        raise HTTPException(status_code=503, detail="Reranker model not initialized")
+    if not payload.documents:
+        raise HTTPException(status_code=400, detail="documents must be a non-empty list")
+
+    try:
+        results = _reranker_model.rerank(payload.query, payload.documents, top_n=payload.top_n)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("rerank failed")
+        raise HTTPException(status_code=502, detail=f"Rerank request failed: {exc}") from exc
+
+    return RerankResponse(results=results, count=len(results))
 
 
 if __name__ == "__main__":
