@@ -44,11 +44,17 @@ QUERY_INSTRUCTION = os.getenv("QUERY_INSTRUCTION", "task: search result | query:
 # model's default.
 TEXT_INSTRUCTION = os.getenv("TEXT_INSTRUCTION", "")
 
-RERANKER_MODEL_NAME = os.getenv("RERANKER_MODEL_NAME", "onnx-community/bge-reranker-v2-m3-ONNX")
+RERANKER_MODEL_NAME = os.getenv("RERANKER_MODEL_NAME", "onnx-community/Qwen3-Reranker-0.6B-ONNX")
 RERANKER_ONNX_FILE_NAME = os.getenv("RERANKER_ONNX_FILE_NAME", "model_quantized.onnx")
 RERANKER_ONNX_SUBFOLDER = os.getenv("RERANKER_ONNX_SUBFOLDER", "onnx")
 RERANKER_MAX_LENGTH = int(os.getenv("RERANKER_MAX_LENGTH", "8192"))
 RERANKER_BATCH_SIZE = int(os.getenv("RERANKER_BATCH_SIZE", "4"))
+# Task description baked into Qwen3-Reranker's judging prompt. Ignored by
+# cross-encoder rerankers (bge-reranker-v2-m3), which have no such prompt.
+RERANKER_INSTRUCTION = os.getenv(
+    "RERANKER_INSTRUCTION",
+    "Given a web search query, retrieve relevant passages that answer the query",
+)
 
 if DEVICE == "cuda" and ONNX_PROVIDER == "CPUExecutionProvider":
     logger.warning(
@@ -92,6 +98,7 @@ def build_reranker_model() -> ONNXReranker:
         provider=ONNX_PROVIDER,
         max_length=RERANKER_MAX_LENGTH,
         batch_size=RERANKER_BATCH_SIZE,
+        instruction=RERANKER_INSTRUCTION,
     )
 
 
@@ -118,6 +125,13 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 class EmbedQueryRequest(BaseModel):
     text: str = Field(..., description="Single query string (query_instruction is applied automatically).")
+    instruction: Optional[str] = Field(
+        None,
+        description=(
+            "Overrides the configured query_instruction prefix for this request. "
+            "Pass an empty string to embed the text with no prefix at all."
+        ),
+    )
 
 
 class EmbedDocumentsRequest(BaseModel):
@@ -139,6 +153,13 @@ class RerankRequest(BaseModel):
     query: str = Field(..., description="Search query to rerank documents against.")
     documents: List[str] = Field(..., description="Candidate documents to score and rerank.")
     top_n: Optional[int] = Field(None, description="If set, only return the top N results.")
+    instruction: Optional[str] = Field(
+        None,
+        description=(
+            "Overrides the reranker's task description for this request. "
+            "Only used by instruction-following rerankers (e.g. Qwen3-Reranker)."
+        ),
+    )
 
 
 class RerankResultItem(BaseModel):
@@ -174,7 +195,7 @@ def embed_query(payload: EmbedQueryRequest):
     if _embed_model is None:
         raise HTTPException(status_code=503, detail="Embedding model not initialized")
     try:
-        vector = _embed_model.embed_query(payload.text)
+        vector = _embed_model.embed_query(payload.text, instruction=payload.instruction)
     except Exception as exc:  # noqa: BLE001
         logger.exception("embed_query failed")
         raise HTTPException(status_code=502, detail=f"Embedding request failed: {exc}") from exc
@@ -209,7 +230,12 @@ def rerank(payload: RerankRequest):
         raise HTTPException(status_code=400, detail="documents must be a non-empty list")
 
     try:
-        results = _reranker_model.rerank(payload.query, payload.documents, top_n=payload.top_n)
+        results = _reranker_model.rerank(
+            payload.query,
+            payload.documents,
+            top_n=payload.top_n,
+            instruction=payload.instruction,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.exception("rerank failed")
         raise HTTPException(status_code=502, detail=f"Rerank request failed: {exc}") from exc
