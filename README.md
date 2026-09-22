@@ -3,7 +3,26 @@
 A small FastAPI service that serves embeddings from
 [`microsoft/harrier-oss-v1-0.6b`](https://huggingface.co/microsoft/harrier-oss-v1-0.6b)
 through [sentence-transformers](https://sbert.net) on torch, loading the model
-straight from its Hugging Face repo (see `st_embeddings.py`).
+straight from its Hugging Face repo.
+
+## Project layout
+
+```
+embedder/            the embedding library (no FastAPI) -- import this from notebooks
+  specs.py           which models exist and how each is prompted
+  prompts.py         query prompts and document templates (pure functions)
+  chunking.py        token-budgeted chunking (pure function)
+  runtime.py         device/dtype resolution, HF auth, model loading
+  model.py           STEmbeddings, tying the above together
+api/                 the FastAPI service
+  config.py          settings, read from env vars
+  schemas.py         request/response bodies
+  routes.py          /health, /embed/query, /embed/documents
+  main.py            app + startup (loads and warms the model)
+tests/               runs without GPU or real weights (fake SentenceTransformer)
+```
+
+Adding a model means adding one entry to `embedder/specs.py`.
 
 ## The model
 
@@ -18,6 +37,11 @@ no prefix. The service applies the right one on each side, so callers just use
 - The default task is `Given a web search query, retrieve relevant passages
   that answer the query`. Change it service-wide with `EMBED_TASK`, or per
   request with the `task` field.
+- Documents are rendered through a **document template** with `{title}` and
+  `{content}` placeholders before embedding. Harrier's default is `{content}`
+  (no prefix). Set `EMBED_DOCUMENT_TEMPLATE`, e.g. `{title}\n\n{content}`, to
+  include the article title, and send titles with `/embed/documents`. When a
+  document has no title, the result is stripped so no stray separator is left.
 - The template ends in `Query: ` **with** a trailing space. That matches how
   harrier was trained, so leave it as is.
 - Harrier supports 32k context. `max_seq_length` is capped at 1024 for
@@ -30,12 +54,23 @@ The model is loaded and warmed at startup, before `/health` reports `ok`.
 ### Using the class directly
 
 ```python
-from st_embeddings import STEmbeddings
+from embedder import STEmbeddings
 
 embeddings = STEmbeddings("harrier", batch_size=64)   # device/dtype auto-detected
 qv = embeddings.embed_query("berapa harga bbm hari ini")
 dv = embeddings.embed_documents(["chunk pertama", "chunk kedua"])  # (n, 1024) float32, L2-normalized
+
+# Custom document template, filled per document:
+titled = STEmbeddings("harrier", document_template="{title}\n\n{content}")
+chunks = titled.chunk_text(article, title=title)       # reserves room for the title
+vectors = titled.embed_documents(chunks, titles=[title] * len(chunks))
+titled.format_document(chunks[0], title)                # the exact string embedded
 ```
+
+The class also still supports `STEmbeddings("gemma")` for
+`google/embeddinggemma-300m` (768d; gated, so it needs `HF_TOKEN`). Its default
+template is `title: {title} | text: {content}`, with `none` used when a
+document has no title. The API service itself loads harrier only.
 
 `STEmbeddings` also offers:
 
@@ -43,8 +78,10 @@ dv = embeddings.embed_documents(["chunk pertama", "chunk kedua"])  # (n, 1024) f
 - `truncate_dim` for Matryoshka truncation
 - `token_length()`
 - `chunk_text()` / `embed_documents_chunked()`, which split over-long inputs
-  on token boundaries (leaving room for special tokens) before embedding each
-  piece.
+  on token boundaries before embedding each piece. The token budget accounts
+  for the rendered template, including the title, so no chunk gets truncated
+  after the title is added. `embed_documents_chunked()` returns the raw
+  `text`, the `embedded_text`, and the `embedding` for each chunk.
 
 ## Endpoints
 
@@ -67,8 +104,10 @@ dv = embeddings.embed_documents(["chunk pertama", "chunk kedua"])  # (n, 1024) f
   internally so one long article doesn't pad out everything batched with it.
   Results come back in the order you sent them.
   ```json
-  { "texts": ["chunk 1 ...", "chunk 2 ..."] }
+  { "texts": ["chunk 1 ...", "chunk 2 ..."], "titles": ["Judul artikel", "Judul artikel"] }
   ```
+  `titles` is optional. When given, it must match `texts` in length and fills
+  the document template's `{title}`; `null` entries mean no title.
   ```json
   { "embeddings": [[0.01, ...], [0.02, ...]], "dimensions": 1024, "count": 2 }
   ```
@@ -79,7 +118,7 @@ dv = embeddings.embed_documents(["chunk pertama", "chunk kedua"])  # (n, 1024) f
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-uvicorn main:app --reload --port 8000
+uvicorn api.main:app --reload --port 8000
 ```
 
 The first run downloads the weights from the Hub, so expect a slow start and
@@ -98,6 +137,20 @@ curl -X POST http://localhost:8000/embed/documents \
   -H "Content-Type: application/json" \
   -d '{"texts": ["chunk pertama", "chunk kedua"]}'
 ```
+
+### Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+The suite swaps in a fake SentenceTransformer, so it needs no GPU and
+downloads no weights. If torch or sentence-transformers aren't installed at
+all, it replaces them with minimal stand-ins. It covers prompt formats,
+document templates, chunk budgets, and the API. It does **not** check the real
+model's output, so do one live call on the target machine after
+dependency upgrades.
 
 ## Deploying
 
@@ -124,6 +177,7 @@ EMBED_BATCH_SIZE=64
 # EMBED_MAX_SEQ_LENGTH=2048
 # EMBED_TRUNCATE_DIM=512
 # EMBED_TASK=Given a news search query, retrieve relevant articles
+# EMBED_DOCUMENT_TEMPLATE={title}\n\n{content}
 ```
 
 ### Persisting weights across deploys
@@ -157,7 +211,7 @@ def embed_documents(texts: list[str]) -> list[list[float]]:
 - Harrier is a Qwen3-architecture decoder that pools the **last** token, so
   its tokenizer is loaded with `padding_side="left"`.
 - **Changing models or settings means re-indexing.** Vectors produced with a
-  different model, `EMBED_TRUNCATE_DIM`, or task instruction are not
+  different model, `EMBED_TRUNCATE_DIM`, document template, or task instruction are not
   comparable with the ones already in your index.
 - Earlier versions of this service ran ONNX Runtime, then multiple
   sentence-transformers models plus a Qwen3 reranker behind `/rerank`. Both
