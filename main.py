@@ -1,10 +1,13 @@
 """
-FastAPI service exposing local embedding inference for
-microsoft/harrier-oss-v1-0.6b through sentence-transformers / torch
-(see st_embeddings.py).
+FastAPI service exposing local ONNX embedding inference via plain ONNX
+Runtime (no torch/sentence-transformers/optimum/llama-index in the request
+path -- see onnx_embeddings.py for why).
 
-Device and dtype default to CUDA + float16 when a GPU is present and CPU +
-float32 otherwise; set DEVICE / DTYPE to pin them (see .env.example).
+IMPORTANT — Railway + GPU: Railway does not currently offer GPU-backed
+services, so this deploys with device="cpu" and provider="CPUExecutionProvider"
+by default. All of the above stays fully configurable via env vars, so the
+exact same code runs unchanged with device="cuda" / CUDAExecutionProvider if
+you deploy this on a GPU host instead (see .env.example).
 """
 
 import os
@@ -15,48 +18,97 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("embeddings-service")
+from onnx_embeddings import ONNXEmbeddings
+from onnx_reranker import ONNXReranker
 
-from st_embeddings import STEmbeddings  # noqa: E402 -- logging must be configured first
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("onnx-embeddings-service")
 
 # ---------------------------------------------------------------------------
 # Config (all overridable via env vars — see .env.example)
 # ---------------------------------------------------------------------------
-DEVICE = os.getenv("DEVICE") or None  # None -> CUDA when available, else CPU
-DTYPE = os.getenv("DTYPE") or None
-EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "64"))
-EMBED_MAX_SEQ_LENGTH = int(os.getenv("EMBED_MAX_SEQ_LENGTH") or 0) or None
-EMBED_TRUNCATE_DIM = int(os.getenv("EMBED_TRUNCATE_DIM") or 0) or None
-EMBED_TASK = os.getenv("EMBED_TASK") or None
+MODEL_NAME = os.getenv("MODEL_NAME", "onnx-community/embeddinggemma-300m-ONNX")
+DEVICE = os.getenv("DEVICE", "cpu")  # "cpu" on Railway; "cuda" if deployed on a GPU host
+EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "8"))
+MAX_LENGTH = int(os.getenv("MAX_LENGTH", "512"))
 
-# Created once at startup and reused across requests.
-_model: Optional[STEmbeddings] = None
+ONNX_FILE_NAME = os.getenv("ONNX_FILE_NAME", "model_quantized.onnx")
+ONNX_SUBFOLDER = os.getenv("ONNX_SUBFOLDER", "onnx")
+# CPUExecutionProvider by default (Railway has no GPU). Set to
+# CUDAExecutionProvider only when DEVICE=cuda on a GPU-enabled host.
+ONNX_PROVIDER = os.getenv("ONNX_PROVIDER", "CPUExecutionProvider")
+
+QUERY_INSTRUCTION = os.getenv("QUERY_INSTRUCTION", "task: search result | query: ")
+# Some models (embeddinggemma included) also support/expect a distinct
+# instruction prefix for documents being indexed. Leave unset to use the
+# model's default.
+TEXT_INSTRUCTION = os.getenv("TEXT_INSTRUCTION", "")
+
+RERANKER_MODEL_NAME = os.getenv("RERANKER_MODEL_NAME", "onnx-community/bge-reranker-v2-m3-ONNX")
+RERANKER_ONNX_FILE_NAME = os.getenv("RERANKER_ONNX_FILE_NAME", "model_quantized.onnx")
+RERANKER_ONNX_SUBFOLDER = os.getenv("RERANKER_ONNX_SUBFOLDER", "onnx")
+RERANKER_MAX_LENGTH = int(os.getenv("RERANKER_MAX_LENGTH", "8192"))
+RERANKER_BATCH_SIZE = int(os.getenv("RERANKER_BATCH_SIZE", "4"))
+
+if DEVICE == "cuda" and ONNX_PROVIDER == "CPUExecutionProvider":
+    logger.warning(
+        "DEVICE=cuda but ONNX_PROVIDER=CPUExecutionProvider — set "
+        "ONNX_PROVIDER=CUDAExecutionProvider to actually use the GPU."
+    )
+
+# Embedding/reranker models are created once at startup and reused across requests.
+_embed_model: Optional[ONNXEmbeddings] = None
+_reranker_model: Optional[ONNXReranker] = None
+
+
+def build_embed_model() -> ONNXEmbeddings:
+    logger.info(
+        "Loading ONNXEmbeddings: model=%s device=%s onnx_file=%s provider=%s",
+        MODEL_NAME, DEVICE, ONNX_FILE_NAME, ONNX_PROVIDER,
+    )
+    return ONNXEmbeddings(
+        model_id=MODEL_NAME,
+        onnx_file_name=ONNX_FILE_NAME,
+        onnx_subfolder=ONNX_SUBFOLDER,
+        device=DEVICE,
+        provider=ONNX_PROVIDER,
+        max_length=MAX_LENGTH,
+        batch_size=EMBED_BATCH_SIZE,
+        query_instruction=QUERY_INSTRUCTION,
+        text_instruction=TEXT_INSTRUCTION,
+    )
+
+
+def build_reranker_model() -> ONNXReranker:
+    logger.info(
+        "Loading ONNXReranker: model=%s device=%s onnx_file=%s provider=%s",
+        RERANKER_MODEL_NAME, DEVICE, RERANKER_ONNX_FILE_NAME, ONNX_PROVIDER,
+    )
+    return ONNXReranker(
+        model_id=RERANKER_MODEL_NAME,
+        onnx_file_name=RERANKER_ONNX_FILE_NAME,
+        onnx_subfolder=RERANKER_ONNX_SUBFOLDER,
+        device=DEVICE,
+        provider=ONNX_PROVIDER,
+        max_length=RERANKER_MAX_LENGTH,
+        batch_size=RERANKER_BATCH_SIZE,
+    )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Load and warm before the healthcheck passes, so the first real request
-    # doesn't pay the download/first-call cost.
-    global _model
-    _model = STEmbeddings(
-        "harrier",
-        device=DEVICE,
-        dtype=DTYPE,
-        batch_size=EMBED_BATCH_SIZE,
-        max_seq_length=EMBED_MAX_SEQ_LENGTH,
-        truncate_dim=EMBED_TRUNCATE_DIM,
-        task=EMBED_TASK,
-    )
-    _model.warmup()
+    global _embed_model, _reranker_model
+    _embed_model = build_embed_model()
+    _reranker_model = build_reranker_model()
     yield
-    _model = None
+    _embed_model = None
+    _reranker_model = None
 
 
 app = FastAPI(
-    title="Embeddings Service",
-    description="Local embedding inference for microsoft/harrier-oss-v1-0.6b (sentence-transformers on torch) wrapped in FastAPI.",
-    version="3.0.0",
+    title="ONNX Embeddings Service",
+    description="Local ONNX embedding inference (plain ONNX Runtime) wrapped in FastAPI, deployable on Railway.",
+    version="1.0.0",
     lifespan=lifespan,
 )
 
@@ -65,11 +117,7 @@ app = FastAPI(
 # Schemas
 # ---------------------------------------------------------------------------
 class EmbedQueryRequest(BaseModel):
-    text: str = Field(..., description="Single query string (the query instruction is applied automatically).")
-    task: Optional[str] = Field(
-        None,
-        description="Overrides the task description in the query instruction for this request.",
-    )
+    text: str = Field(..., description="Single query string (query_instruction is applied automatically).")
 
 
 class EmbedDocumentsRequest(BaseModel):
@@ -79,7 +127,6 @@ class EmbedDocumentsRequest(BaseModel):
 class EmbeddingResponse(BaseModel):
     embedding: List[float]
     dimensions: int
-    prompt: str
 
 
 class EmbeddingsResponse(BaseModel):
@@ -88,60 +135,86 @@ class EmbeddingsResponse(BaseModel):
     count: int
 
 
+class RerankRequest(BaseModel):
+    query: str = Field(..., description="Search query to rerank documents against.")
+    documents: List[str] = Field(..., description="Candidate documents to score and rerank.")
+    top_n: Optional[int] = Field(None, description="If set, only return the top N results.")
+
+
+class RerankResultItem(BaseModel):
+    index: int
+    document: str
+    score: float
+
+
+class RerankResponse(BaseModel):
+    results: List[RerankResultItem]
+    count: int
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 @app.get("/health")
 def health():
-    if _model is None:
-        return {"status": "loading"}
     return {
         "status": "ok",
-        "model": _model.spec.model_id,
-        "dimensions": _model.dim,
-        "max_seq_length": _model.model.max_seq_length,
-        "device": _model.device,
-        "dtype": _model.dtype,
+        "model": MODEL_NAME,
+        "device": DEVICE,
+        "onnx_file_name": ONNX_FILE_NAME,
+        "onnx_provider": ONNX_PROVIDER,
+        "reranker_model": RERANKER_MODEL_NAME,
+        "reranker_onnx_file_name": RERANKER_ONNX_FILE_NAME,
     }
 
 
 @app.post("/embed/query", response_model=EmbeddingResponse)
 def embed_query(payload: EmbedQueryRequest):
-    """Embed a single query string, with the query instruction applied automatically."""
-    if _model is None:
+    """Embed a single query string, with query_instruction applied automatically."""
+    if _embed_model is None:
         raise HTTPException(status_code=503, detail="Embedding model not initialized")
     try:
-        vector = _model.embed_query(payload.text, task=payload.task)
+        vector = _embed_model.embed_query(payload.text)
     except Exception as exc:  # noqa: BLE001
         logger.exception("embed_query failed")
         raise HTTPException(status_code=502, detail=f"Embedding request failed: {exc}") from exc
 
-    return EmbeddingResponse(
-        embedding=vector.tolist(),
-        dimensions=len(vector),
-        prompt=_model.query_prompt(payload.task),
-    )
+    return EmbeddingResponse(embedding=vector, dimensions=len(vector))
 
 
 @app.post("/embed/documents", response_model=EmbeddingsResponse)
 def embed_documents(payload: EmbedDocumentsRequest):
-    """Embed a batch of documents/chunks (respects EMBED_BATCH_SIZE internally)."""
-    if _model is None:
+    """Embed a batch of documents/chunks (respects embed_batch_size internally)."""
+    if _embed_model is None:
         raise HTTPException(status_code=503, detail="Embedding model not initialized")
     if not payload.texts:
         raise HTTPException(status_code=400, detail="texts must be a non-empty list")
 
     try:
-        vectors = _model.embed_documents(payload.texts)
+        vectors = _embed_model.embed_documents(payload.texts)
     except Exception as exc:  # noqa: BLE001
         logger.exception("embed_documents failed")
         raise HTTPException(status_code=502, detail=f"Embedding request failed: {exc}") from exc
 
-    return EmbeddingsResponse(
-        embeddings=vectors.tolist(),
-        dimensions=int(vectors.shape[1]),
-        count=int(vectors.shape[0]),
-    )
+    dims = len(vectors[0]) if vectors else 0
+    return EmbeddingsResponse(embeddings=vectors, dimensions=dims, count=len(vectors))
+
+
+@app.post("/rerank", response_model=RerankResponse)
+def rerank(payload: RerankRequest):
+    """Score and rerank documents against a query, highest relevance first."""
+    if _reranker_model is None:
+        raise HTTPException(status_code=503, detail="Reranker model not initialized")
+    if not payload.documents:
+        raise HTTPException(status_code=400, detail="documents must be a non-empty list")
+
+    try:
+        results = _reranker_model.rerank(payload.query, payload.documents, top_n=payload.top_n)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("rerank failed")
+        raise HTTPException(status_code=502, detail=f"Rerank request failed: {exc}") from exc
+
+    return RerankResponse(results=results, count=len(results))
 
 
 if __name__ == "__main__":
