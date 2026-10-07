@@ -85,32 +85,119 @@ document has no title. The API service itself loads harrier only.
 
 ## Endpoints
 
-- `GET /health`: the model, dimensions, sequence length, device, and dtype.
-- `POST /embed/query`: embed a single query. The query instruction is applied
-  automatically; `task` overrides it for this request.
-  ```json
-  { "text": "berapa harga bbm hari ini", "task": "Cari berita yang relevan" }
-  ```
-  ```json
-  {
-    "embedding": [0.013, ...],
-    "dimensions": 1024,
-    "prompt": "Instruct: Cari berita yang relevan\nQuery: "
-  }
-  ```
-  The echoed `prompt` is the exact prefix that was applied, which helps when
-  debugging retrieval quality.
-- `POST /embed/documents`: embed a batch. Texts are grouped by length
-  internally so one long article doesn't pad out everything batched with it.
-  Results come back in the order you sent them.
-  ```json
-  { "texts": ["chunk 1 ...", "chunk 2 ..."], "titles": ["Judul artikel", "Judul artikel"] }
-  ```
-  `titles` is optional. When given, it must match `texts` in length and fills
-  the document template's `{title}`; `null` entries mean no title.
-  ```json
-  { "embeddings": [[0.01, ...], [0.02, ...]], "dimensions": 1024, "count": 2 }
-  ```
+All bodies are JSON. Vectors are L2-normalized `float` lists of length
+`dimensions` (1024 for harrier, or `EMBED_TRUNCATE_DIM` if set). They're
+shortened to `[...]` in the examples below.
+
+### `GET /health`
+
+No request body.
+
+**Response** (`200`, once the model is loaded and warmed):
+
+```json
+{
+  "status": "ok",
+  "model": "microsoft/harrier-oss-v1-0.6b",
+  "dimensions": 1024,
+  "max_seq_length": 1024,
+  "device": "cuda",
+  "dtype": "float16",
+  "document_template": "{content}"
+}
+```
+
+While the model is still loading, it returns `{ "status": "loading" }`.
+
+### `POST /embed/query`
+
+Embeds a **single** search query. The query instruction is added for you, so
+send the raw query text only.
+
+**Request**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `text` | string | yes | The query, without any prefix. |
+| `task` | string \| null | no | Task description for this request only. Defaults to `EMBED_TASK`, or harrier's built-in default. |
+
+```json
+{
+  "text": "berapa harga bbm hari ini",
+  "task": "Given a news search query, retrieve relevant news articles"
+}
+```
+
+**Response**
+
+| Field | Type | Description |
+|---|---|---|
+| `embedding` | float[] | The query vector. |
+| `dimensions` | int | Length of `embedding`. |
+| `prompt` | string | The exact prefix put in front of `text`. Useful for debugging retrieval. |
+
+```json
+{
+  "embedding": [0.0132, -0.0217, 0.0048, ...],
+  "dimensions": 1024,
+  "prompt": "Instruct: Given a news search query, retrieve relevant news articles\nQuery: "
+}
+```
+
+The model sees `prompt + text`. If you omit `task`, `prompt` shows the default
+instruction.
+
+### `POST /embed/documents`
+
+Embeds a **batch** of documents or chunks, i.e. the content you search over.
+No query instruction is added; each text is rendered through the document
+template instead. Texts are grouped by length internally, so one long article
+doesn't pad out everything batched with it, and results come back in the
+order you sent them.
+
+**Request**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `texts` | string[] | yes | Documents or chunks to embed. Must be non-empty. |
+| `titles` | (string \| null)[] | no | One title per text, filled into the template's `{title}`. Must be the same length as `texts`; `null` means no title. Ignored by the default `{content}` template. |
+
+```json
+{
+  "texts": ["chunk 1 ...", "chunk 2 ..."],
+  "titles": ["Judul artikel", "Judul artikel"]
+}
+```
+
+**Response**
+
+| Field | Type | Description |
+|---|---|---|
+| `embeddings` | float[][] | One vector per text, in request order (`embeddings[i]` ↔ `texts[i]`). |
+| `dimensions` | int | Length of each vector. |
+| `count` | int | Number of vectors, equal to `len(texts)`. |
+
+```json
+{
+  "embeddings": [
+    [0.0101, -0.0342, ...],
+    [0.0215, 0.0067, ...]
+  ],
+  "dimensions": 1024,
+  "count": 2
+}
+```
+
+### Errors
+
+Errors come back as `{ "detail": "..." }`.
+
+| Status | When |
+|---|---|
+| `400` | `texts` is empty, or `titles` length doesn't match `texts`. |
+| `422` | Body fails validation (missing `text`/`texts`, wrong types). |
+| `502` | The model raised an error while encoding. |
+| `503` | The model isn't loaded yet. |
 
 ## Local development
 
